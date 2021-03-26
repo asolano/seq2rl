@@ -3,7 +3,6 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # See: https://pytorch.org/tutorials/beginner/transformer_tutorial.html
@@ -68,20 +67,19 @@ class CustomTransformer(nn.Module):
                 tgt_key_padding_mask=None
                 ):
         # Apply linear and positional encoding to sequences
-        # FIXME pycharm complains about callable, needs explicit forward()
         encoded_src = self.pos_enc.forward(self.fc_src(src) * math.sqrt(self.d_model))
         encoded_tgt = self.pos_enc.forward(self.fc_tgt(tgt) * math.sqrt(self.d_model))
 
         # FIXME here or outside?
-        src_mask = self.transformer.generate_square_subsequent_mask(encoded_src.shape[0]).to(device)
-        tgt_mask = self.transformer.generate_square_subsequent_mask(encoded_tgt.shape[0]).to(device)
+        #src_mask = self.transformer.generate_square_subsequent_mask(encoded_src.shape[0]).to(device)
+        #tgt_mask = self.transformer.generate_square_subsequent_mask(encoded_tgt.shape[0]).to(device)
 
         # Send to the model
-        output = self.transformer(encoded_src,
-                                  encoded_tgt,
+        output = self.transformer(src=encoded_src,
+                                  tgt=encoded_tgt,
                                   src_mask=src_mask,
-                                  tgt_mask=tgt_mask)
+                                  tgt_mask=tgt_mask,
+                                  src_key_padding_mask=src_key_padding_mask,
+                                  tgt_key_padding_mask=tgt_key_padding_mask)
 
         return self.fc_out(output)
-
-

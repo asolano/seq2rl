@@ -27,6 +27,8 @@ class Policy(nn.Module):
         self.saved_actions = []
         self.rewards = []
 
+        self.episodes = 0
+
     def forward(self, x):
         x = F.relu(self.affine1(x))
 
@@ -43,9 +45,13 @@ class Policy(nn.Module):
         return action_prob, state_values
 
 
-def select_action(model, observation):
-    state = torch.from_numpy(observation).float()
+def select_action(model, observation, device):
+    state = torch.from_numpy(observation).float().to(device)
+    # FIXME inference?
     probabilities, state_value = model(state)
+
+    if any(torch.isnan(probabilities)):
+        print(f'ERROR Invalid probabilities?! {probabilities}')
 
     # Create a categorical distribution over the list of probabilities of actions
     m = Categorical(probabilities)
@@ -57,10 +63,10 @@ def select_action(model, observation):
     model.saved_actions.append(SavedAction(m.log_prob(action), state_value))
 
     # Return the action to take
-    return action.item()
+    return model, action.item()
 
 
-def finish_episode(model, optimizer, gamma, eps):
+def finish_episode(model, optimizer, gamma, eps, device):
     R = 0
     saved_actions = model.saved_actions
     policy_losses = []  # list to save actor (policy) loss
@@ -73,7 +79,7 @@ def finish_episode(model, optimizer, gamma, eps):
         R = r + gamma * R
         returns.insert(0, R)
 
-    returns = torch.tensor(returns)
+    returns = torch.tensor(returns).to(device)
     returns = (returns - returns.mean()) / (returns.std() + eps)
 
     for (log_prob, value), R in zip(saved_actions, returns):
@@ -83,7 +89,7 @@ def finish_episode(model, optimizer, gamma, eps):
         policy_losses.append(-log_prob * advantage)
 
         # calculate critic (value) loss using L1 smooth loss
-        value_losses.append(F.smooth_l1_loss(value, torch.tensor([R])))
+        value_losses.append(F.smooth_l1_loss(value, torch.tensor([R]).to(device)))
 
     # reset gradients
     optimizer.zero_grad()
@@ -99,23 +105,94 @@ def finish_episode(model, optimizer, gamma, eps):
     del model.rewards[:]
     del model.saved_actions[:]
 
+    # Count episodes
+    model.episodes += 1
 
-def train_actor_critic(model, optimizer, gamma, eps, environment, max_episodes, max_steps, log_interval):
+    return model, optimizer
+
+
+# Train the policy using the world model (and some of the environment to kickstart)
+# def train_actor_critic_wm(actor_model,
+#                           optimizer,
+#                           gamma,
+#                           eps,
+#                           env,
+#                           world_model,
+#                           max_episodes,
+#                           max_steps,
+#                           device,
+#                           logger,
+#                           log_interval,
+#                           ):
+#     reward_history = deque(maxlen=100)
+#     total_steps = 0
+#
+#     # TODO pass here args.sequence_length
+#     fake_env = FakeEnvironment(env, world_model, seq_length=35, device=device)
+#
+#     # FIXME debug copy pasta from the other version
+#     for i in range(max_episodes):
+#         observation = fake_env.reset()
+#         episode_reward = 0
+#         for s in range(max_steps):
+#             actor_model, action = select_action(actor_model, observation)
+#             observation, reward, done, _ = fake_env.step(action)
+#
+#             actor_model.rewards.append(reward)
+#             episode_reward += reward
+#             total_steps += 1
+#             if done:
+#                 break
+#
+#         # cumulative moving average
+#         reward_history.append(episode_reward)
+#         cumulative_average = sum(reward_history) / len(reward_history)
+#
+#         # back propagation
+#         actor_model, optimizer = finish_episode(actor_model, optimizer, gamma, eps)
+#
+#         # log results
+#         if i % log_interval == 0:
+#             logger.debug(f'Episode {i}, last reward {episode_reward:.2f}, average reward {cumulative_average:.2f}')
+#
+#         # check if the environment has been solved
+#         if cumulative_average > env.spec.reward_threshold:
+#             logger.debug(f'Solved? Running reward={cumulative_average:.2f}, threshold={env.spec.reward_threshold}')
+#             break
+#
+#     logger.debug(f'total steps={total_steps}, last episode steps={s}')
+#     return actor_model, optimizer
+#
+
+# Train the policy using the environment
+def train_actor_critic(policy,
+                       optimizer,
+                       gamma,
+                       eps,
+                       env,
+                       max_episodes,
+                       max_steps,
+                       device,
+                       log_interval,
+                       logger):
     reward_history = deque(maxlen=100)
-
     total_steps = 0
 
     for i in range(max_episodes):
-        observation = environment.reset()
+        observation = env.reset()
         episode_reward = 0
+        min_reward, max_reward = float('inf'), float('-inf')
 
         for s in range(max_steps):
-            action = select_action(model, observation)
-            observation, reward, done, _ = environment.step(action)
+            policy, action = select_action(policy, observation, device)
+            observation, reward, done, _ = env.step(action)
 
-            model.rewards.append(reward)
+            min_reward = min(reward, min_reward)
+            max_reward = max(reward, max_reward)
+
+            policy.rewards.append(reward)
             episode_reward += reward
-            total_steps += s
+            total_steps += 1
             if done:
                 break
 
@@ -124,34 +201,28 @@ def train_actor_critic(model, optimizer, gamma, eps, environment, max_episodes, 
         cumulative_average = sum(reward_history) / len(reward_history)
 
         # back propagation
-        finish_episode(model, optimizer, gamma, eps)
+        policy, optimizer = finish_episode(policy, optimizer, gamma, eps, device=device)
 
         # log results
         if i % log_interval == 0:
-            print(f'Episode {i} last reward {episode_reward:.2f} average reward {cumulative_average:.2f}')
+            # TODO steps and min/max reward, last is nt that interesting
+            print(f'Episode {i}: steps={s+1} rewards={min_reward:.2f}/{max_reward:.2f}/{cumulative_average:.2f} (min/max/cum.avg)')
 
         # check if the environment is solved
-        if cumulative_average > environment.spec.reward_threshold:
-            print(
-                f'Solved. Running reward={cumulative_average:.2f}, threshold={environment.spec.reward_threshold}')
+        if cumulative_average > env.spec.reward_threshold:
+            print(f'Solved? Running reward={cumulative_average:.2f}, threshold={env.spec.reward_threshold}')
             break
+
     print(f'total steps={total_steps}, last episode steps={s}')
+    return policy, optimizer
 
 
-def test_training():
-    # env = gym.make('CartPole-v1')
-    # env = gym.make('MountainCar-v0')
-    # env = gym.make('Acrobot-v1')
-    env = gym.make('LunarLander-v2')
-    # FIXME continuous actions require a different model
-    # env = gym.make('LunarLanderContinuous-v2')
-
+def test_training_actor_critic(env, device):
     # FIXME args
-    seed = 42
     lr = 7e-4  # 3e-2
     gamma = 0.99
     max_episodes = 2_000
-    max_steps = 10_000
+    max_steps = 1_000
     log_interval = 50
 
     env.seed(seed)
@@ -162,14 +233,41 @@ def test_training():
     else:
         n_actions = env.action_space.n
 
-    model = Policy(n_state=env.observation_space.shape[0],
-                   n_actions=n_actions,
-                   fc1_dims=1024)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    policy = Policy(n_state=env.observation_space.shape[0],
+                    n_actions=n_actions,
+                    fc1_dims=512)
+    optimizer = optim.Adam(policy.parameters(), lr=lr)
     eps = np.finfo(np.float32).eps.item()
 
-    train_actor_critic(model, optimizer, gamma, eps, env, max_episodes, max_steps, log_interval)
+    new_policy, optimizer = train_actor_critic(policy,
+                                               optimizer,
+                                               gamma,
+                                               eps,
+                                               env,
+                                               max_episodes,
+                                               max_steps,
+                                               device=device,
+                                               logger=None,
+                                               log_interval=log_interval)
+
+    print(new_policy.episodes)
+
+    return new_policy
 
 
 if __name__ == '__main__':
-    test_training()
+    # env = gym.make('CartPole-v1')
+    # env = gym.make('MountainCar-v0')
+    # env = gym.make('Acrobot-v1')
+    env = gym.make('LunarLander-v2')
+    seed = 42
+    env.seed(seed)
+    torch.manual_seed(seed)
+
+    from utils import get_device
+
+    device = get_device(cuda=False)
+
+    # FIXME continuous actions require a different model
+    # env = gym.make('LunarLanderContinuous-v2')
+    test_training_actor_critic(env, device=device)

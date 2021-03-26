@@ -34,10 +34,11 @@ def set_random_seed(seed: int, logger: logging.Logger) -> torch.Generator:
     return generator
 
 
-def get_device(args, logger=None) -> torch.device:
+def get_device(cuda: bool, logger=None) -> torch.device:
     cuda_available = torch.cuda.is_available()
+    # TODO device_count
     if cuda_available:
-        if not args.cuda:
+        if not cuda:
             if logger is not None:
                 logger.info(f'CUDA device is available but not selected! Adding the CLI option is recommended.')
             device = torch.device('cpu')
