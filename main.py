@@ -13,7 +13,7 @@ import datetime
 
 from utils import (create_logger, set_random_seed, get_device, to_column_batches)
 from typing import Tuple, Optional
-from model import CustomTransformer
+from model import CustomTransformer, CustomRNN
 
 
 def parse_arguments():
@@ -80,7 +80,26 @@ def parse_arguments():
     parser.add_argument('--cuda',
                         action='store_true',
                         help='use CUDA')
-
+    # RNN
+    parser.add_argument('--nhid',
+                        type=int,
+                        default=200,
+                        help='number of hidden units per layer')
+    parser.add_argument('--model',
+                        type=str,
+                        default='Transformer',
+                        help='type of recurrent net (RNN_TANH, RNN_RELU, LSTM, GRU, Transformer)')
+    parser.add_argument('--emsize',
+                        type=int,
+                        default=256,  # 200
+                        help='size of word embeddings')
+    parser.add_argument('--nlayers',
+                        type=int,
+                        default=2,
+                        help='number of layers')
+    parser.add_argument('--tied',
+                        action='store_true',
+                        help='tie the word embedding and softmax weights')
     args = parser.parse_args()
     return args
 
@@ -257,12 +276,25 @@ def get_ith_batch(source, i, count):
     return data
 
 
+def repackage_hidden(h):
+    """Wraps hidden states in new Tensors, to detach them from their history."""
+
+    if isinstance(h, torch.Tensor):
+        return h.detach()
+    else:
+        return tuple(repackage_hidden(v) for v in h)
+
+
 def train(model, criterion, source_batches, target_batches, args, lr, epoch, device, logger=None):
     # Enable dropout
     model.train()
 
     total_loss = 0.0
     start_time = time.time()
+
+    # Initialize hidden layers for RNN
+    if isinstance(model, CustomRNN):
+        hidden = model.init_hidden(batch_size=args.batch_size)
 
     for batch, i in enumerate(range(0, source_batches.size(0) - 1, args.sequence_length)):
         # Get source and target sequences
@@ -273,7 +305,14 @@ def train(model, criterion, source_batches, target_batches, args, lr, epoch, dev
         model.zero_grad()
 
         # Get output from model
-        output = model(src=source, tgt=target, device=device)
+        if isinstance(model, CustomTransformer):
+            output = model.forward(src=source, tgt=target, device=device)
+        elif isinstance(model, CustomRNN):
+            # FIXME LSTM gives error: ‘tuple’ object has no attribute ‘size’
+            hidden = repackage_hidden(hidden)
+            output, hidden = model(input=source, hidden=hidden)
+        else:
+            raise NotImplementedError("Unsupported model class")
 
         # Calculate and back-propagate loss
         loss = criterion(output, target)
@@ -315,6 +354,9 @@ def evaluate(model, criterion, source_batches, target_batches, args, device, log
     model.eval()
     total_loss = 0.0
 
+    if isinstance(model, CustomRNN):
+        hidden = model.init_hidden(batch_size=source_batches.size(1))  # eval batch size
+
     log_i = random.randrange(0, source_batches.size(0) - 1, args.sequence_length)
     with torch.no_grad():
         for i in range(0, source_batches.size(0) - 1, args.sequence_length):
@@ -322,7 +364,14 @@ def evaluate(model, criterion, source_batches, target_batches, args, device, log
             source = get_ith_batch(source_batches, i, count=args.sequence_length)
             target = get_ith_batch(target_batches, i, count=args.sequence_length)
 
-            output = model(src=source, tgt=target, device=device)
+            if isinstance(model, CustomTransformer):
+                output = model.forward(src=source, tgt=target, device=device)
+            elif isinstance(model, CustomRNN):
+                # FIXME targets?
+                output, hidden = model.forward(source, hidden)
+                hidden = repackage_hidden(hidden)
+            else:
+                raise NotImplementedError("Unsupported model class")
 
             if logger is not None and i == log_i:
                 logger.debug(f"Sample evaluation"
@@ -382,18 +431,31 @@ def train_world_model(args, device, logger=None) -> torch.Tensor:
     test_outputs_batches = to_column_batches(test_outputs, args.batch_size, device=device)
 
     # FIXME more transformer parameters as arguments: heads, layers, etc..
-    model = CustomTransformer(src_dim=train_inputs.shape[1],
-                              tgt_dim=train_outputs.shape[1],
-                              d_model=args.num_features,
-                              nhead=2,
-                              num_encoder_layers=2,
-                              num_decoder_layers=2,
-                              dim_feedforward=1024,
-                              dropout=args.dropout,
-                              max_seq_length=args.sequence_length
-                              ).to(device)
+    if args.model == 'Transformer':
+        model = CustomTransformer(src_dim=train_inputs.shape[1],
+                                  tgt_dim=train_outputs.shape[1],
+                                  d_model=args.num_features,
+                                  nhead=2,
+                                  num_encoder_layers=2,
+                                  num_decoder_layers=2,
+                                  dim_feedforward=1024,
+                                  dropout=args.dropout,
+                                  max_seq_length=args.sequence_length
+                                  ).to(device)
+    else:
+        n_source = train_inputs.shape[1]  # FIXME source E dimension
+        n_target = train_outputs.shape[1]
+        model = CustomRNN(rnn_type=args.model,
+                          n_source=n_source,
+                          n_target=n_target,
+                          n_input=args.emsize,
+                          n_hidden=args.nhid,
+                          n_layers=args.nlayers,
+                          dropout=args.dropout,
+                          tie_weights=args.tied).to(device)
+
     if logger is not None:
-        logger.debug(f'Built transformer model: "{model}"')
+        logger.debug(f'Built model: "{model}"')
 
     # TODO separate from here
 

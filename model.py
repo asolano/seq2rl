@@ -85,3 +85,67 @@ class CustomTransformer(nn.Module):
         return self.fc_out(output)
 
 
+# PyTorch example code
+class CustomRNN(nn.Module):
+    """Container module with an encoder, a recurrent module, and a decoder."""
+
+    def __init__(self, rnn_type, n_source, n_target, n_input, n_hidden, n_layers, dropout=0.5, tie_weights=False):
+        super(CustomRNN, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.encoder = nn.Linear(in_features=n_source, out_features=n_input)
+        # if rnn_type == 'LSTM':
+        #     self.rnn = nn.LSTM(input_size=n_input, hidden_size=n_hidden, num_layers=n_layers, dropout=dropout)
+        # elif rnn_type == 'GRU':
+        #     self.rnn = nn.GRU(input_size=n_input, hidden_size=n_hidden, num_layers=n_layers, dropout=dropout)
+        if rnn_type in ['LSTM', 'GRU']:
+            self.rnn = getattr(nn, rnn_type)(n_input, n_hidden, n_layers, dropout=dropout)
+        else:
+            if rnn_type == 'RNN_TANH':
+                non_linearity = 'tanh'
+            elif rnn_type == 'RNN_RELU':
+                non_linearity = 'relu'
+            else:
+                raise ValueError("""An invalid option for `--model` was supplied,
+                                 options are ['LSTM', 'GRU', 'RNN_TANH' or 'RNN_RELU']""")
+            self.rnn = nn.RNN(n_input, n_hidden, n_layers, nonlinearity=non_linearity, dropout=dropout)
+
+        self.decoder = nn.Linear(n_hidden, n_target)
+
+        # Optionally tie weights as in:
+        # "Using the Output Embedding to Improve Language Models" (Press & Wolf 2016)
+        # https://arxiv.org/abs/1608.05859
+        # and
+        # "Tying Word Vectors and Word Classifiers: A Loss Framework for Language Modeling" (Inan et al. 2016)
+        # https://arxiv.org/abs/1611.01462
+        if tie_weights:
+            if n_hidden != n_input:
+                raise ValueError('When using the tied flag, nhid must be equal to emsize')
+            self.decoder.weight = self.encoder.weight
+
+        self.init_weights()
+
+        self.rnn_type = rnn_type
+        self.n_hidden = n_hidden
+        self.n_layers = n_layers
+
+    def init_weights(self):
+        init_range = 0.1
+        nn.init.uniform_(self.encoder.weight, -init_range, init_range)
+        nn.init.zeros_(self.decoder.weight)
+        nn.init.uniform_(self.decoder.weight, -init_range, init_range)
+
+    def forward(self, input, hidden):
+        embedded = self.dropout(self.encoder(input))
+        output, hidden = self.rnn.forward(embedded, hidden)
+        output = self.dropout(output)
+        decoded = self.decoder(output)
+        return decoded, hidden
+
+    def init_hidden(self, batch_size):
+        weight = next(self.parameters())
+        if self.rnn_type == 'LSTM':
+            n_directions = 1
+            return (weight.new_zeros(self.n_layers * n_directions, batch_size, self.n_hidden),
+                    weight.new_zeros(self.n_layers * n_directions, batch_size, self.n_hidden))
+        else:
+            return weight.new_zeros(self.n_layers, batch_size, self.n_hidden)
