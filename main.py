@@ -14,7 +14,7 @@ import datetime
 from utils import (create_logger, set_random_seed, get_device, to_column_batches)
 from typing import Tuple, Optional
 from model import CustomTransformer
-from transformer import train_with_batches, generate_dataset, split_dataset
+from transformer import train_with_batches, generate_dataset, split_dataset, generate_dataset2
 from actor_critic import Policy, train_actor_critic, test_training_actor_critic, select_action
 from fake_env import FakeEnvironment
 from torch import optim
@@ -162,7 +162,7 @@ def dreamer_algorithm(env_name,
     valid_sources, valid_targets = torch.FloatTensor().to(device), torch.FloatTensor().to(device)
     test_sources, test_targets = torch.FloatTensor().to(device), torch.FloatTensor().to(device)
 
-    max_loop_steps = 30  # TODO parameter
+    max_loop_steps = 1000  # TODO parameter
     log_interval = 25
 
     loop_steps = 0
@@ -174,20 +174,19 @@ def dreamer_algorithm(env_name,
         # env.reset()
 
         # collect dataset from real environment
-        logger.debug(f'Getting {seed_episodes} rollouts from environment')
+        logger.debug(f'Getting data from environment')
 
-        new_sources, new_targets = generate_dataset(env,
-                                                    num_rollouts=seed_episodes,
-                                                    device=device,
-                                                    policy=policy,
-                                                    logger=logger)
+        #new_sources, new_targets = generate_dataset(env,
+        new_sources, new_targets = generate_dataset2(env,
+                                                     num_tokens=seed_episodes * 50,  # collect_interval?
+                                                     device=device,
+                                                     policy=policy,
+                                                     logger=logger)
 
         new_train_sources, new_valid_sources, new_test_sources = split_dataset(new_sources, split)
         new_train_targets, new_valid_targets, new_test_targets = split_dataset(new_targets, split)
 
         # covert to S,N,E shape
-        # FIXME
-        # to_column_batches(new_train_targets, batch_size=1, device=device)
 
         new_train_sources = to_column_batches(new_train_sources, batch_size, device)
         new_train_targets = to_column_batches(new_train_targets, batch_size, device)
@@ -196,15 +195,7 @@ def dreamer_algorithm(env_name,
         new_test_sources = to_column_batches(new_test_sources, batch_size, device)
         new_test_targets = to_column_batches(new_test_targets, batch_size, device)
 
-        # new_train_sources = new_train_sources.unsqueeze(1)
-        # new_train_targets = new_train_targets.unsqueeze(1)
-        # new_valid_sources = new_valid_sources.unsqueeze(1)
-        # new_valid_targets = new_valid_targets.unsqueeze(1)
-        # new_test_sources = new_test_sources.unsqueeze(1)
-        # new_test_targets = new_test_targets.unsqueeze(1)
-
         # add to existing datasets
-        # FIXME remove duplicates? see torch.unique
         train_sources = torch.cat([train_sources, new_train_sources])
         train_targets = torch.cat([train_targets, new_train_targets])
         valid_sources = torch.cat([valid_sources, new_valid_sources])
@@ -212,26 +203,12 @@ def dreamer_algorithm(env_name,
         test_sources = torch.cat([test_sources, new_test_sources])
         test_targets = torch.cat([test_targets, new_test_targets])
 
-        # keep only last N samples for training
-        # FIXME train_batches multiple of sequence_length? use to_column_batches?
-        max_samples = 20_000
-        max_train_samples = int(max_samples * split[0])
-        max_test_samples = int(max_samples * split[1])
-        max_valid_samples = int(max_samples * split[2])
-
-        train_sources = train_sources[-max_train_samples:]
-        train_targets = train_targets[-max_train_samples:]
-        test_sources = test_sources[-max_test_samples:]
-        test_targets = test_targets[-max_test_samples:]
-        valid_sources = valid_sources[-max_valid_samples:]
-        valid_targets = valid_targets[-max_valid_samples:]
-
-        logger.info(f'Train samples: {train_sources.shape}')
-        logger.info(f'Test samples {test_sources.shape}')
-        logger.info(f'Valid samples {valid_sources.shape}')
+        logger.info(f'Train: {train_sources.shape}')
+        logger.info(f'Test: {test_sources.shape}')
+        logger.info(f'Valid: {valid_sources.shape}')
 
         # use the datasets to learn/improve the world model
-        logger.debug(f'Improving world model')
+        logger.debug(f'Training world model')
         world_model = train_with_batches(epochs=args.epochs,
                                          sequence_length=args.sequence_length,
                                          clip=args.clip,
@@ -247,17 +224,20 @@ def dreamer_algorithm(env_name,
                                          log_interval=log_interval,
                                          logger=logger)
 
-        print(f'TRANSFORMER id={id(world_model)}')
+        # print(f'TRANSFORMER id={id(world_model)}')
 
         # use world model to learn a policy
-        logger.debug(f'Using world model to improve policy')
+        logger.debug(f'Training policy')
         gamma = 0.99
-        max_episodes = 100
+        max_episodes = 50
         max_steps = 100
         eps = np.finfo(np.float32).eps.item()
 
         # TODO args.sequence_length
-        fake_env = FakeEnvironment(env, world_model, seq_length=args.sequence_length, device=device)
+        fake_env = FakeEnvironment(env=env,
+                                   model=world_model,
+                                   seq_length=args.sequence_length,
+                                   device=device)
 
         # DEBUG use env for the real environment
         policy, optimizer = train_actor_critic(policy,
@@ -273,7 +253,7 @@ def dreamer_algorithm(env_name,
                                                log_interval=log_interval,
                                                logger=logger)
 
-        print(f'POLICY id={id(policy)} episodes={policy.episodes}')
+        logger.debug(f'policy episodes={policy.episodes}')
 
         # check policies quality in the real environment
         average_score, policy = test_policy_quality(env,
@@ -291,7 +271,7 @@ def dreamer_algorithm(env_name,
         # check loop termination
         loop_steps += 1
         if loop_steps >= max_loop_steps:
-            print('Reached max loop steps, breaking early...')
+            logger.debug('Reached max loop steps, breaking early...')
             converged = True
 
 
@@ -312,12 +292,12 @@ def main():
     dreamer_algorithm(env_name=args.environment,
                       device=device,
                       args=args,
-                      seed_episodes=5,
+                      seed_episodes=1000,
                       collect_interval=100,
-                      batch_size=4,
+                      batch_size=args.batch_size,
                       sequence_length=35,
                       horizon=15,
-                      num_trials=100,
+                      num_trials=25,
                       logger=logger)
 
     logger.info('All done.')

@@ -59,6 +59,35 @@ def get_observation_data(observation):
     return observation
 
 
+def generate_dataset2(env, device, num_tokens, policy, logger):
+    sources = torch.Tensor()
+    targets = torch.Tensor()
+
+    observation = env.reset()
+    while len(sources) < num_tokens:
+        if policy is None:
+            action = env.action_space.sample()
+        else:
+            policy, action = select_action(policy, observation, device)
+
+        s = torch.cat([torch.Tensor(observation), torch.Tensor([action])])
+        sources = torch.cat([sources, s.reshape(1, -1)])
+        observation, reward, done, _ = env.step(action)
+        t = torch.cat([
+            torch.Tensor([reward]),
+            torch.Tensor([done]),
+            torch.Tensor(observation)
+        ])
+        targets = torch.cat([targets, t.reshape(1, -1)])
+        if len(sources) % 10_000 == 0:
+            if logger is not None:
+                logger.info(f'Generated {len(sources)} samples')
+        if done:
+            observation = env.reset()
+
+    return sources, targets
+
+
 def generate_dataset(env,
                      device,
                      num_rollouts=1000,
@@ -97,7 +126,6 @@ def generate_dataset(env,
         while not done:
             # TODO Use a callable for the policy
             if policy is None:
-
                 action = env.action_space.sample()
             else:
                 policy, action = select_action(policy, last_obs, device)
@@ -215,28 +243,25 @@ def _train(model,
         model.zero_grad()
 
         # Masks
-        src_mask = None
-        # FIXME not always sequence length?
-        if source.shape[0] != sequence_length:
-            # TODO pad
-            # pad = (0, 0, 0, 0, 0, sequence_length - source.shape[0])
-            # source = torch.nn.functional.pad(source, pad=pad, value=float('inf'))
-            # src_mask = source.eq(float('inf'))
-            # target = torch.nn.functional.pad(target, pad=pad, value=float('inf'))
-            logger.warn(f'Source shape is {source.shape[0]}, sequence_length is {sequence_length}. Discarding samples and returning model as-is')
-            return model
+        source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask = \
+            _pad_and_masks(source, target, model, sequence_length, device)
 
-        tgt_mask = model.transformer.generate_square_subsequent_mask(target.shape[0]).to(device)
+        # Shift target right 1 token
+        tgt_inp, tgt_out = target[:-1], target[1:]
+        tgt_mask = tgt_mask[:-1, :-1]  # 35x35 -> 34x34
+        if tgt_key_padding_mask is not None:
+            tgt_key_padding_mask = tgt_key_padding_mask[:, :-1]
 
         # Get output from model
         output = model.forward(src=source,
-                               tgt=target,
-                               src_mask=src_mask,  # input padding mask
-                               tgt_mask=tgt_mask,
-                               device=device)
+                               tgt=tgt_inp,
+                               src_key_padding_mask=src_key_padding_mask,
+                               memory_key_padding_mask=memory_key_padding_mask,
+                               tgt_key_padding_mask=tgt_key_padding_mask,
+                               tgt_mask=tgt_mask)
 
         # Calculate and back-propagate loss
-        loss = criterion(output, target)
+        loss = criterion(output, tgt_out)
         loss.backward()
 
         # TODO Confirm if this is needed for transformers
@@ -271,6 +296,36 @@ def _train(model,
     return model
 
 
+def _pad_and_masks(source, target, model, sequence_length, device):
+    src_key_padding_mask = None
+    tgt_key_padding_mask = None
+    memory_key_padding_mask = None
+
+    if source.shape[0] != sequence_length:
+        # FIXME skip
+        tgt_mask = model.transformer.generate_square_subsequent_mask(target.shape[0]).to(device)
+        return source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask
+
+        # Reshape tensors and fill with inf as temporary marker for [pad]
+        pad = (0, 0, 0, 0, 0, sequence_length - source.shape[0])
+        source = torch.nn.functional.pad(source, pad=pad, value=float('inf'))
+
+        # Set to True where there is padding
+        # This is per batch, shape is (N, S)
+        src_key_padding_mask = source[:, :, 0].eq(float('inf')).T
+        memory_key_padding_mask = src_key_padding_mask.clone()
+        target = torch.nn.functional.pad(target, pad=pad, value=float('inf'))
+        tgt_key_padding_mask = target[:, :, 0].eq(float('inf')).T
+
+        # Replace inf with 0
+        source[source == float('inf')] = 0.0
+        target[target == float('inf')] = 0.0
+
+    tgt_mask = model.transformer.generate_square_subsequent_mask(target.shape[0]).to(device)
+
+    return source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask
+
+
 def _evaluate(model, criterion, source_batches, target_batches, sequence_length, device, logger=None):
     model.eval()
     total_loss = 0.0
@@ -282,24 +337,31 @@ def _evaluate(model, criterion, source_batches, target_batches, sequence_length,
             source = get_ith_batch(source_batches, i, count=sequence_length)
             target = get_ith_batch(target_batches, i, count=sequence_length)
 
-            output = model(src=source, tgt=target, device=device)
+            source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask = \
+                _pad_and_masks(source, target, model, sequence_length, device)
 
-            if logger is not None and i == log_i:
-                logger.debug(f"Sample evaluation"
-                             f"\n* batch number: {i}"
-                             f"\n* reward"
-                             f"\n- output: {output[-1, -1, 0]:2.3f}"
-                             f"\n- target: {target[-1, -1, 0]:2.3f}"
-                             f"\n* done"
-                             f"\n- output: {output[-1, -1, 1]:2.3f}"
-                             f"\n- target: {target[-1, -1, 1]:2.3f}"
-                             f"\n* observation"
-                             f"\n- output: {output[-1, -1, 2:]}"
-                             f"\n- target: {target[-1, -1, 2:]}")
+            # Shift target right 1 token
+            tgt_inp, tgt_out = target[:-1], target[1:]
+            tgt_mask = tgt_mask[:-1, :-1]  # FIXME i.e. 35x35 -> 34x34
+            if tgt_key_padding_mask is not None:
+                tgt_key_padding_mask = tgt_key_padding_mask[:, :-1]
 
-            total_loss += len(source) * criterion(output, target).item()
+            output = model(src=source,
+                           tgt=tgt_inp,
+                           src_key_padding_mask=src_key_padding_mask,
+                           memory_key_padding_mask=memory_key_padding_mask,
+                           tgt_key_padding_mask=tgt_key_padding_mask,
+                           tgt_mask=tgt_mask)
 
-    return total_loss / (len(source_batches) - 1)
+            # if logger is not None and i == log_i:
+            #     logger.debug(f"Sample evaluation"
+            #                  f"\n batch number: {i}"
+            #                  f"\n output: {output[-1, 0, :]}"
+            #                  f"\n target: {tgt_out[-1, 0, :]}")
+
+            total_loss += len(source) * criterion(output, tgt_out).item()
+
+    return model, total_loss / (len(source_batches) - 1)
 
 
 # NOTES
@@ -329,10 +391,12 @@ def train_transformer(generate,
     if generate:
         env = gym.make(env_name)
         # TODO Replace rollouts for minimum (approximate) number of samples/tokens?
-        data_inputs, data_outputs = generate_dataset(env,
-                                                     device=device,
-                                                     num_rollouts=rollouts,
-                                                     logger=logger)
+        # data_inputs, data_outputs = generate_dataset(env,
+        #                                              device=device,
+        #                                              num_rollouts=rollouts,
+        #                                              logger=logger)
+
+        data_inputs, data_outputs = generate_dataset2(env, device, rollouts * 50, None, logger)
         save_dataset(data_folder, env_name, data_inputs, data_outputs)
     else:
         data_inputs, data_outputs = load_dataset(data_folder, env_name, logger)
@@ -425,13 +489,13 @@ def train_with_batches(epochs,
                        logger=logger)
 
         # Validation
-        val_loss = _evaluate(model=model,
-                             criterion=criterion,
-                             source_batches=valid_inputs_batches,
-                             target_batches=valid_outputs_batches,
-                             sequence_length=sequence_length,
-                             device=device,
-                             logger=logger)
+        model, val_loss = _evaluate(model=model,
+                                    criterion=criterion,
+                                    source_batches=valid_inputs_batches,
+                                    target_batches=valid_outputs_batches,
+                                    sequence_length=sequence_length,
+                                    device=device,
+                                    logger=logger)
 
         logger.info('=' * 89)
         logger.info(f'End of epoch {epoch:3d}'
@@ -451,12 +515,13 @@ def train_with_batches(epochs,
             lr /= 4.0
 
     # Test data
-    test_loss = _evaluate(model=model,
-                          criterion=criterion,
-                          source_batches=test_inputs_batches,
-                          target_batches=test_outputs_batches,
-                          sequence_length=sequence_length,
-                          device=device)
+    model, test_loss = _evaluate(model=model,
+                                 criterion=criterion,
+                                 source_batches=test_inputs_batches,
+                                 target_batches=test_outputs_batches,
+                                 sequence_length=sequence_length,
+                                 logger=logger,
+                                 device=device)
 
     logger.info(f'End of training | test loss {test_loss:5.4f} | test ppl {math.exp(test_loss):8.4f}')
 
@@ -473,16 +538,17 @@ if __name__ == '__main__':
     set_random_seed(seed, logger)
     device = get_device(cuda, logger)
 
+    # env_name ='CartPole-v1'
+    env_name = 'LunarLander-v2'
     model = train_transformer(generate=True,
-                              # env_name='CartPole-v1',
-                              env_name='LunarLander-v2',
-                              rollouts=1000,
+                              env_name=env_name,
+                              rollouts=10_000,
                               clip=0.25,
                               epochs=40,
                               log_interval=50,
-                              save='transformer_model.pt',
+                              save=f'model-{env_name}.pt',
                               data_folder='./data',
-                              batch_size=30,
+                              batch_size=128,
                               num_features=256,
                               dropout=0.1,
                               sequence_length=35,

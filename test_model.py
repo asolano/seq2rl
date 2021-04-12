@@ -8,15 +8,18 @@ from fake_env import FakeEnvironment
 from main import test_policy_quality
 
 if __name__ == '__main__':
-    save_file = 'transformer_model.pt'
-    world_model = torch.load(save_file)
-    print(world_model)
+    env_name = 'LunarLander-v2'
 
-    env = gym.make('LunarLander-v2')
+    save_file = f'model-{env_name}.pt'
+    world_model = torch.load(save_file)
+    # print(world_model)
+
+    env = gym.make(env_name)
     device = torch.device('cpu')
 
-    fake_env = FakeEnvironment(env, world_model, seq_length=10, device=device)
+    fake_env = FakeEnvironment(env, world_model, seq_length=35, device=device)
 
+    # FIXME get from environment
     policy = Policy(n_state=8,
                     n_actions=4,
                     fc1_dims=512).to(device)
@@ -29,6 +32,7 @@ if __name__ == '__main__':
     max_steps = 200
     eps = np.finfo(np.float32).eps.item()
 
+    print(f'Training AC for {max_episodes} episodes')
     policy, optimizer = train_actor_critic(policy,
                                            optimizer,
                                            gamma,
@@ -42,5 +46,8 @@ if __name__ == '__main__':
                                            log_interval=50,
                                            logger=None)
 
-    avg_reward, policy = test_policy_quality(env, policy, 100, max_steps, device, logger=None)
+    num_trials = 100
+    print(f'Evaluating with real environment for {num_trials} trials')
+
+    avg_reward, policy = test_policy_quality(env, policy, num_trials, max_steps, device, logger=None)
     print(f'Avg. reward={avg_reward}')

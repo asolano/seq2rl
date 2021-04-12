@@ -47,11 +47,7 @@ class Policy(nn.Module):
 
 def select_action(model, observation, device):
     state = torch.from_numpy(observation).float().to(device)
-    # FIXME inference?
     probabilities, state_value = model(state)
-
-    if any(torch.isnan(probabilities)):
-        print(f'ERROR Invalid probabilities?! {probabilities}')
 
     # Create a categorical distribution over the list of probabilities of actions
     m = Categorical(probabilities)
@@ -89,7 +85,7 @@ def finish_episode(model, optimizer, gamma, eps, device):
         policy_losses.append(-log_prob * advantage)
 
         # calculate critic (value) loss using L1 smooth loss
-        value_losses.append(F.smooth_l1_loss(value, torch.tensor([R]).to(device)))
+        value_losses.append(F.smooth_l1_loss(value, torch.tensor([R], dtype=torch.float32).to(device)))
 
     # reset gradients
     optimizer.zero_grad()
@@ -110,59 +106,6 @@ def finish_episode(model, optimizer, gamma, eps, device):
 
     return model, optimizer
 
-
-# Train the policy using the world model (and some of the environment to kickstart)
-# def train_actor_critic_wm(actor_model,
-#                           optimizer,
-#                           gamma,
-#                           eps,
-#                           env,
-#                           world_model,
-#                           max_episodes,
-#                           max_steps,
-#                           device,
-#                           logger,
-#                           log_interval,
-#                           ):
-#     reward_history = deque(maxlen=100)
-#     total_steps = 0
-#
-#     # TODO pass here args.sequence_length
-#     fake_env = FakeEnvironment(env, world_model, seq_length=35, device=device)
-#
-#     # FIXME debug copy pasta from the other version
-#     for i in range(max_episodes):
-#         observation = fake_env.reset()
-#         episode_reward = 0
-#         for s in range(max_steps):
-#             actor_model, action = select_action(actor_model, observation)
-#             observation, reward, done, _ = fake_env.step(action)
-#
-#             actor_model.rewards.append(reward)
-#             episode_reward += reward
-#             total_steps += 1
-#             if done:
-#                 break
-#
-#         # cumulative moving average
-#         reward_history.append(episode_reward)
-#         cumulative_average = sum(reward_history) / len(reward_history)
-#
-#         # back propagation
-#         actor_model, optimizer = finish_episode(actor_model, optimizer, gamma, eps)
-#
-#         # log results
-#         if i % log_interval == 0:
-#             logger.debug(f'Episode {i}, last reward {episode_reward:.2f}, average reward {cumulative_average:.2f}')
-#
-#         # check if the environment has been solved
-#         if cumulative_average > env.spec.reward_threshold:
-#             logger.debug(f'Solved? Running reward={cumulative_average:.2f}, threshold={env.spec.reward_threshold}')
-#             break
-#
-#     logger.debug(f'total steps={total_steps}, last episode steps={s}')
-#     return actor_model, optimizer
-#
 
 # Train the policy using the environment
 def train_actor_critic(policy,
@@ -209,9 +152,10 @@ def train_actor_critic(policy,
             print(f'Episode {i}: steps={s+1} rewards={min_reward:.2f}/{max_reward:.2f}/{cumulative_average:.2f} (min/max/cum.avg)')
 
         # check if the environment is solved
-        if cumulative_average > env.spec.reward_threshold:
-            print(f'Solved? Running reward={cumulative_average:.2f}, threshold={env.spec.reward_threshold}')
-            break
+        # FIXME the fake env can mark it as solved by mistake by giving too much reward
+        #  if cumulative_average > env.spec.reward_threshold:
+        #    print(f'Solved? Running reward={cumulative_average:.2f}, threshold={env.spec.reward_threshold}')
+        #    break
 
     print(f'total steps={total_steps}, last episode steps={s}')
     return policy, optimizer

@@ -59,27 +59,25 @@ class CustomTransformer(nn.Module):
     def forward(self,
                 src,
                 tgt,
-                # FIXME get mask from outside?
-                device,
                 src_mask=None,
                 tgt_mask=None,
+                memory_mask=None,
                 src_key_padding_mask=None,
-                tgt_key_padding_mask=None
+                tgt_key_padding_mask=None,
+                memory_key_padding_mask=None
                 ):
         # Apply linear and positional encoding to sequences
         encoded_src = self.pos_enc.forward(self.fc_src(src) * math.sqrt(self.d_model))
         encoded_tgt = self.pos_enc.forward(self.fc_tgt(tgt) * math.sqrt(self.d_model))
-
-        # FIXME here or outside?
-        #src_mask = self.transformer.generate_square_subsequent_mask(encoded_src.shape[0]).to(device)
-        #tgt_mask = self.transformer.generate_square_subsequent_mask(encoded_tgt.shape[0]).to(device)
 
         # Send to the model
         output = self.transformer(src=encoded_src,
                                   tgt=encoded_tgt,
                                   src_mask=src_mask,
                                   tgt_mask=tgt_mask,
+                                  memory_mask=memory_mask,
                                   src_key_padding_mask=src_key_padding_mask,
-                                  tgt_key_padding_mask=tgt_key_padding_mask)
+                                  tgt_key_padding_mask=tgt_key_padding_mask,
+                                  memory_key_padding_mask=memory_key_padding_mask)
 
         return self.fc_out(output)
