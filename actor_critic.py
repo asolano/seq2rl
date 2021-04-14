@@ -9,6 +9,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 
+import utils
+
 SavedAction = namedtuple('SavedAction', ['log_prob', 'value'])
 
 
@@ -26,8 +28,6 @@ class Policy(nn.Module):
         # action and reward buffer
         self.saved_actions = []
         self.rewards = []
-
-        self.episodes = 0
 
     def forward(self, x):
         x = F.relu(self.affine1(x))
@@ -101,9 +101,6 @@ def finish_episode(model, optimizer, gamma, eps, device):
     del model.rewards[:]
     del model.saved_actions[:]
 
-    # Count episodes
-    model.episodes += 1
-
     return model, optimizer
 
 
@@ -148,8 +145,8 @@ def train_actor_critic(policy,
 
         # log results
         if i % log_interval == 0:
-            # TODO steps and min/max reward, last is nt that interesting
-            print(f'Episode {i}: steps={s+1} rewards={min_reward:.2f}/{max_reward:.2f}/{cumulative_average:.2f} (min/max/cum.avg)')
+            print(
+                f'Episode {i}: steps={s + 1} min_reward={min_reward:.2f} max_reward={max_reward:.2f} avg_reward={cumulative_average:.2f}')
 
         # check if the environment is solved
         # FIXME the fake env can mark it as solved by mistake by giving too much reward
@@ -161,57 +158,103 @@ def train_actor_critic(policy,
     return policy, optimizer
 
 
-def test_training_actor_critic(env, device):
-    # FIXME args
-    lr = 7e-4  # 3e-2
-    gamma = 0.99
-    max_episodes = 2_000
-    max_steps = 1_000
-    log_interval = 50
+def test_policy_quality(env, policy, num_trials, max_steps, device, logger=None):
+    total_reward = 0
 
+    for i in range(num_trials):
+        done = False
+        trial_reward = 0
+        steps = 0
+        observation = env.reset()
+
+        # NOTE infinite environments need a step limit
+        while not done:
+            policy, action = select_action(policy, observation, device)
+            observation, reward, done, _ = env.step(action)
+            trial_reward += reward
+            steps += 1
+            if steps > max_steps:
+                done = True
+        total_reward += trial_reward
+        if logger is not None:
+            logger.debug(f'Trial {i + 1} of {num_trials}, reward={trial_reward}')
+
+    return total_reward / num_trials, policy
+
+
+if __name__ == '__main__':
+    from utils import get_device
+
+    # env = gym.make('CartPole-v1')
+    # env = gym.make('MountainCar-v0')
+    # env = gym.make('Acrobot-v1')
+    env = gym.make('LunarLander-v2')
+    # FIXME continuous actions require a different model
+    # env = gym.make('LunarLanderContinuous-v2')
+
+    seed = 42
     env.seed(seed)
     torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    device = get_device(cuda=False)
+    logger = utils.create_logger("ac")
+
+    n_chunks = 1  # 10
+    total_episodes = 1_000
+    chunk_episodes = int(total_episodes / n_chunks)
+
+    lr = 7e-4  # 3e-2
+    gamma = 0.99
+    max_steps = 250
+    log_interval = 100
 
     if type(env.action_space) == gym.spaces.box.Box:
         n_actions = env.action_space.shape[0]
     else:
         n_actions = env.action_space.n
-
     policy = Policy(n_state=env.observation_space.shape[0],
                     n_actions=n_actions,
                     fc1_dims=512)
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     eps = np.finfo(np.float32).eps.item()
 
-    new_policy, optimizer = train_actor_critic(policy,
+    # Untrained
+    reward, policy = test_policy_quality(env=env,
+                                         policy=policy,
+                                         num_trials=10,
+                                         max_steps=max_steps,
+                                         device=device,
+                                         logger=logger)
+    logger.info(f'Untrained reward = {reward}')
+
+    # Check if retraining is possible
+    for i in range(n_chunks):
+        logger.info(f'Training chunk {i + 1} of {n_chunks}')
+        policy, optimizer = train_actor_critic(policy,
                                                optimizer,
                                                gamma,
                                                eps,
                                                env,
-                                               max_episodes,
+                                               chunk_episodes,
                                                max_steps,
                                                device=device,
-                                               logger=None,
+                                               logger=logger,
                                                log_interval=log_interval)
 
-    print(new_policy.episodes)
+        reward, policy = test_policy_quality(env=env,
+                                             policy=policy,
+                                             num_trials=10,
+                                             max_steps=max_steps,
+                                             device=device,
+                                             logger=logger)
+        logger.info(f'Training chunk {i + 1} reward = {reward}')
 
-    return new_policy
-
-
-if __name__ == '__main__':
-    # env = gym.make('CartPole-v1')
-    # env = gym.make('MountainCar-v0')
-    # env = gym.make('Acrobot-v1')
-    env = gym.make('LunarLander-v2')
-    seed = 42
-    env.seed(seed)
-    torch.manual_seed(seed)
-
-    from utils import get_device
-
-    device = get_device(cuda=False)
-
-    # FIXME continuous actions require a different model
-    # env = gym.make('LunarLanderContinuous-v2')
-    test_training_actor_critic(env, device=device)
+    # Final
+    reward, policy = test_policy_quality(env=env,
+                                         policy=policy,
+                                         num_trials=10,
+                                         max_steps=max_steps,
+                                         device=device,
+                                         logger=logger)
+    logger.info(f'Trained reward = {reward}')

@@ -22,30 +22,9 @@ class FakeEnvironment(object):
         return self.env.spec
 
     def _initialize(self):
-
         sources, targets = generate_dataset2(self.env,
                                              self.device,
                                              self.seq_length, None, None)
-
-        # Prefill the history buffer with data from the real environment
-        #sources = torch.Tensor()
-        #targets = torch.Tensor()
-
-        # Generate mini-dataset
-        # observation = self.env.reset()
-        # while len(sources) < self.seq_length:
-        #     action = self.env.action_space.sample()
-        #     s = torch.cat([torch.Tensor(observation), torch.Tensor([action])])
-        #     sources = torch.cat([sources, s.reshape(1, 1, -1)])
-        #     observation, reward, done, _ = self.env.step(action)
-        #     t = torch.cat([
-        #         torch.Tensor([reward]),
-        #         torch.Tensor([done]),
-        #         torch.Tensor(observation)
-        #     ])
-        #     targets = torch.cat([targets, t.reshape(1, 1, -1)])
-        #     if done:
-        #         observation = self.env.reset()
 
         self.last_observation = targets[-1, 2:].numpy()
 
@@ -73,8 +52,6 @@ class FakeEnvironment(object):
             self.inputs = self.inputs[1:, ]
             self.outputs = self.outputs[1:, ]
 
-        # FIXME shift one right?
-        # self.outputs = self.outputs[1:]
         # Prepare target mask
         tgt_mask = get_attention_mask(self.outputs.size(0)).to(self.device)
 
@@ -89,7 +66,7 @@ class FakeEnvironment(object):
         prediction = output[-1, 0, :]
 
         # Add to output history
-        self.outputs = torch.cat([self.outputs, output[-1,0:]]).to(self.device)
+        self.outputs = torch.cat([self.outputs, output[-1, 0:]]).to(self.device)
 
         # Extract elements from prediction
         reward = prediction[0].item()

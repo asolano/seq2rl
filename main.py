@@ -15,7 +15,7 @@ from utils import (create_logger, set_random_seed, get_device, to_column_batches
 from typing import Tuple, Optional
 from model import CustomTransformer
 from transformer import train_with_batches, generate_dataset, split_dataset, generate_dataset2
-from actor_critic import Policy, train_actor_critic, test_training_actor_critic, select_action
+from actor_critic import Policy, train_actor_critic, test_policy_quality
 from fake_env import FakeEnvironment
 from torch import optim
 
@@ -89,27 +89,6 @@ def parse_arguments():
     return args
 
 
-def test_policy_quality(environment, policy, num_trials, max_steps, device, logger=None):
-    total_reward = 0
-
-    for i in range(num_trials):
-        done = False
-        trial_reward = 0
-        steps = 0
-        observation = environment.reset()
-
-        # NOTE infinite environments need a step limit
-        while not done and steps < max_steps:
-            policy, action = select_action(policy, observation, device)
-            observation, reward, done, _ = environment.step(action)
-            trial_reward += reward
-            steps += 1
-        total_reward += trial_reward
-        # logger.debug(f'Trial {i}/{num_trials} reward={total_reward}')
-
-    return total_reward / num_trials, policy
-
-
 def dreamer_algorithm(env_name,
                       args,
                       device,
@@ -162,11 +141,28 @@ def dreamer_algorithm(env_name,
     valid_sources, valid_targets = torch.FloatTensor().to(device), torch.FloatTensor().to(device)
     test_sources, test_targets = torch.FloatTensor().to(device), torch.FloatTensor().to(device)
 
-    max_loop_steps = 1000  # TODO parameter
+    max_loop_steps = 100  # TODO parameter
     log_interval = 25
 
     loop_steps = 0
     split = 0.8, 0.1, 0.1
+
+    # FIXME pretrain slightly the policy on real env
+    policy, optimizer = train_actor_critic(policy,
+                                           optimizer,
+                                           gamma=0.99,
+                                           eps=1e-5,
+                                           env=env,
+                                           max_episodes=100,
+                                           max_steps=250,
+                                           device=device,
+                                           log_interval=log_interval,
+                                           logger=logger)
+
+    fake_env = FakeEnvironment(env=env,
+                               model=world_model,
+                               seq_length=args.sequence_length,
+                               device=device)
 
     converged = False
     while not converged:
@@ -176,9 +172,8 @@ def dreamer_algorithm(env_name,
         # collect dataset from real environment
         logger.debug(f'Getting data from environment')
 
-        #new_sources, new_targets = generate_dataset(env,
         new_sources, new_targets = generate_dataset2(env,
-                                                     num_tokens=seed_episodes * 50,  # collect_interval?
+                                                     num_tokens=seed_episodes * 50,
                                                      device=device,
                                                      policy=policy,
                                                      logger=logger)
@@ -187,7 +182,6 @@ def dreamer_algorithm(env_name,
         new_train_targets, new_valid_targets, new_test_targets = split_dataset(new_targets, split)
 
         # covert to S,N,E shape
-
         new_train_sources = to_column_batches(new_train_sources, batch_size, device)
         new_train_targets = to_column_batches(new_train_targets, batch_size, device)
         new_valid_sources = to_column_batches(new_valid_sources, batch_size, device)
@@ -224,28 +218,26 @@ def dreamer_algorithm(env_name,
                                          log_interval=log_interval,
                                          logger=logger)
 
-        # print(f'TRANSFORMER id={id(world_model)}')
-
         # use world model to learn a policy
         logger.debug(f'Training policy')
         gamma = 0.99
-        max_episodes = 50
-        max_steps = 100
+        max_episodes = 100
+        max_steps = 250
         eps = np.finfo(np.float32).eps.item()
 
-        # TODO args.sequence_length
-        fake_env = FakeEnvironment(env=env,
-                                   model=world_model,
-                                   seq_length=args.sequence_length,
-                                   device=device)
+        # fake_env = FakeEnvironment(env=env,
+        #                            model=world_model,
+        #                            seq_length=args.sequence_length,
+        #                            device=device)
 
-        # DEBUG use env for the real environment
+        # Update environment's world model
+        fake_env.model = world_model
+
+        # DEBUG use env for the real environment, it seems to learn properly
         policy, optimizer = train_actor_critic(policy,
                                                optimizer,
                                                gamma,
                                                eps,
-                                               # FIXME with env the policy learns properly
-                                               # env,
                                                fake_env,
                                                max_episodes,
                                                max_steps,
@@ -253,11 +245,10 @@ def dreamer_algorithm(env_name,
                                                log_interval=log_interval,
                                                logger=logger)
 
-        logger.debug(f'policy episodes={policy.episodes}')
-
         # check policies quality in the real environment
-        average_score, policy = test_policy_quality(env,
-                                                    policy,
+
+        average_score, policy = test_policy_quality(env=env,
+                                                    policy=policy,
                                                     num_trials=num_trials,
                                                     max_steps=max_steps,
                                                     logger=logger,
@@ -292,12 +283,12 @@ def main():
     dreamer_algorithm(env_name=args.environment,
                       device=device,
                       args=args,
-                      seed_episodes=1000,
+                      seed_episodes=100,
                       collect_interval=100,
                       batch_size=args.batch_size,
                       sequence_length=35,
                       horizon=15,
-                      num_trials=25,
+                      num_trials=20,
                       logger=logger)
 
     logger.info('All done.')

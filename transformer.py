@@ -79,7 +79,7 @@ def generate_dataset2(env, device, num_tokens, policy, logger):
             torch.Tensor(observation)
         ])
         targets = torch.cat([targets, t.reshape(1, -1)])
-        if len(sources) % 10_000 == 0:
+        if len(sources) % 1000 == 0:
             if logger is not None:
                 logger.info(f'Generated {len(sources)} samples')
         if done:
@@ -390,12 +390,6 @@ def train_transformer(generate,
     # TODO create a folder for each environment in the dataset save path
     if generate:
         env = gym.make(env_name)
-        # TODO Replace rollouts for minimum (approximate) number of samples/tokens?
-        # data_inputs, data_outputs = generate_dataset(env,
-        #                                              device=device,
-        #                                              num_rollouts=rollouts,
-        #                                              logger=logger)
-
         data_inputs, data_outputs = generate_dataset2(env, device, rollouts * 50, None, logger)
         save_dataset(data_folder, env_name, data_inputs, data_outputs)
     else:
