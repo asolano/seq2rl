@@ -14,7 +14,7 @@ import datetime
 from utils import (create_logger, set_random_seed, get_device, to_column_batches)
 from typing import Tuple, Optional
 from model import CustomTransformer
-from transformer import train_with_batches, generate_dataset, split_dataset, generate_dataset2
+from transformer import train_with_batches, split_dataset, generate_dataset2
 from actor_critic import Policy, train_actor_critic, test_policy_quality
 from fake_env import FakeEnvironment
 from torch import optim
@@ -71,7 +71,7 @@ def parse_arguments():
                         help='path to save the log files')
     parser.add_argument('--epochs',
                         type=int,
-                        default=20,  # 20
+                        default=20,
                         help='upper epoch limit')
     parser.add_argument('--save',
                         type=str,
@@ -109,8 +109,11 @@ def dreamer_algorithm(env_name,
     else:
         raise NotImplementedError("Get action dimensions")
 
-    src_dim = obs_dim + action_dim
-    tgt_dim = 1 + 1 + obs_dim  # reward and done are scalars
+    # reward and done are scalars
+    reward_dim = 1
+    done_dim = 1
+    src_dim = obs_dim + action_dim + done_dim
+    tgt_dim = reward_dim + obs_dim + done_dim
     world_model = CustomTransformer(src_dim=src_dim,
                                     tgt_dim=tgt_dim,
                                     d_model=args.num_features,
@@ -134,7 +137,7 @@ def dreamer_algorithm(env_name,
                     fc1_dims=fc1_dims)
     policy = policy.to(device)
 
-    lr = 7e-4
+    lr = 5e-4
     optimizer = optim.Adam(policy.parameters(), lr=lr)
 
     train_sources, train_targets = torch.FloatTensor().to(device), torch.FloatTensor().to(device)
@@ -153,16 +156,16 @@ def dreamer_algorithm(env_name,
                                            gamma=0.99,
                                            eps=1e-5,
                                            env=env,
-                                           max_episodes=100,
+                                           max_episodes=50,
                                            max_steps=250,
                                            device=device,
                                            log_interval=log_interval,
                                            logger=logger)
 
-    fake_env = FakeEnvironment(env=env,
-                               model=world_model,
-                               seq_length=args.sequence_length,
-                               device=device)
+    # fake_env = FakeEnvironment(env=env,
+    #                            model=world_model,
+    #                            seq_length=args.sequence_length,
+    #                            device=device)
 
     converged = False
     while not converged:
@@ -221,17 +224,14 @@ def dreamer_algorithm(env_name,
         # use world model to learn a policy
         logger.debug(f'Training policy')
         gamma = 0.99
-        max_episodes = 100
+        max_episodes = 50
         max_steps = 250
         eps = np.finfo(np.float32).eps.item()
 
-        # fake_env = FakeEnvironment(env=env,
-        #                            model=world_model,
-        #                            seq_length=args.sequence_length,
-        #                            device=device)
-
-        # Update environment's world model
-        fake_env.model = world_model
+        fake_env = FakeEnvironment(env=env,
+                                   model=world_model,
+                                   seq_length=args.sequence_length,
+                                   device=device)
 
         # DEBUG use env for the real environment, it seems to learn properly
         policy, optimizer = train_actor_critic(policy,
@@ -286,7 +286,7 @@ def main():
                       seed_episodes=100,
                       collect_interval=100,
                       batch_size=args.batch_size,
-                      sequence_length=35,
+                      sequence_length=args.sequence_length,
                       horizon=15,
                       num_trials=20,
                       logger=logger)

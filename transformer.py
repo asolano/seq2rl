@@ -64,19 +64,43 @@ def generate_dataset2(env, device, num_tokens, policy, logger):
     targets = torch.Tensor()
 
     observation = env.reset()
+
+    # FIXME get from env
+    action_dim = 1
+    done_dim = 1
+    reward_dim = 1
+
+    # SOS, EOS tokens for sources and targets
+    # Add an extra float to the vector, normally a zero
+    source_sos = torch.zeros(size=(observation.size + action_dim + done_dim,))
+    source_sos[-1] = 1.0
+    target_sos = torch.zeros(size=(reward_dim + observation.size + done_dim,))
+    target_sos[-1] = 1.0
+    source_eos = torch.zeros(size=source_sos.size())
+    source_eos[-1] = 2.0
+    target_eos = torch.zeros(size=target_sos.size())
+    target_eos[-1] = 2.0
+
+    sources = torch.cat([sources, source_sos.reshape(1, -1)])
+    targets = torch.cat([targets, target_sos.reshape(1, -1)])
+
     while len(sources) < num_tokens:
         if policy is None:
             action = env.action_space.sample()
         else:
             policy, action = select_action(policy, observation, device)
 
-        s = torch.cat([torch.Tensor(observation), torch.Tensor([action])])
+        s = torch.cat([
+            torch.Tensor(observation),
+            torch.Tensor([action]),
+            torch.Tensor([0.0])  # extra float
+        ])
         sources = torch.cat([sources, s.reshape(1, -1)])
         observation, reward, done, _ = env.step(action)
         t = torch.cat([
             torch.Tensor([reward]),
-            torch.Tensor([done]),
-            torch.Tensor(observation)
+            torch.Tensor(observation),
+            torch.Tensor([0.0])  # extra float
         ])
         targets = torch.cat([targets, t.reshape(1, -1)])
         if len(sources) % 1000 == 0:
@@ -85,114 +109,14 @@ def generate_dataset2(env, device, num_tokens, policy, logger):
         if done:
             observation = env.reset()
 
+            # Add EOS for both sources and targets
+            sources = torch.cat([sources, source_eos.reshape(1, -1)])
+            targets = torch.cat([targets, target_eos.reshape(1, -1)])
+            # SOS to mark beginning of next episode
+            sources = torch.cat([sources, source_sos.reshape(1, -1)])
+            targets = torch.cat([targets, target_sos.reshape(1, -1)])
+
     return sources, targets
-
-
-def generate_dataset(env,
-                     device,
-                     num_rollouts=1000,
-                     policy=None,
-                     logger=None) -> Tuple[torch.Tensor, torch.Tensor]:
-    entries = []
-
-    # TODO extract as functions
-    # FIXME Box, Discrete, Dict...
-    # Get dimensions
-    is_dict_obs = type(env.observation_space) is gym.spaces.dict.Dict
-    if is_dict_obs:
-        obs_dim = env.observation_space['observation'].shape[0]
-    else:
-        obs_dim = env.observation_space.shape[0]
-
-    # FIXME get directly from action_space
-    action = env.action_space.sample()
-    if type(action) is np.ndarray:
-        act_dim = action.shape[0]
-    else:
-        act_dim = 1
-
-    # FIXME use this
-    rew_dim = 1
-    done_dim = 1
-
-    for r in range(num_rollouts):
-        observation = env.reset()
-        done = False
-
-        steps = 0
-
-        last_obs = get_observation_data(observation)
-
-        while not done:
-            # TODO Use a callable for the policy
-            if policy is None:
-                action = env.action_space.sample()
-            else:
-                policy, action = select_action(policy, last_obs, device)
-
-            observation, reward, done, info = env.step(action)
-            observation = get_observation_data(observation)
-            t = torch.cat([
-                # np array to tensor
-                torch.Tensor(last_obs),
-                # scalar or numpy array
-                # torch.Tensor([action]),
-                action_1d(action),
-                # scalar to tensor
-                torch.Tensor([reward]),
-                torch.Tensor([done])
-            ])
-
-            steps += 1
-
-            entries.append(t)
-            last_obs = get_observation_data(observation)
-
-            if done:
-                env.reset()
-
-        if logger is not None:
-            logger.debug(f'Rollout {r + 1}/{num_rollouts} ({steps} steps)')
-
-    env.close()
-
-    big_tensor = torch.cat(entries).reshape(-1, entries[0].shape[0])
-
-    # Big tensor shape is like this (without the time step):
-
-    # t    | obs    act    rew    don
-    # 0    | A      B      C      D
-    # 1    | E      F      G      H
-    # 2    | I      J      K      L
-    # ...
-
-    # where
-    # t = time step
-    # obs = observation
-    # act = action
-    # rew = reward
-    # don = done
-    # and [A, B, C... ] are 1D tensors (reshape if needed)
-
-    # Input to output is
-    # t=0 [A, B] -> [C, D, E]  obs + action => reward, done, next observation
-    # t=1 [E, F] -> [G, H, I]
-    # etc.
-
-    # FIXME do the separation after splitting into train/valid/test?
-
-    # TODO Check this for action dim
-    # Inputs are the first two "columns" (obs + act)
-    # They discard the last row (no next observation)
-    # inputs = x[:-1, :split]
-    dataset_inputs = big_tensor[:-1, :(obs_dim + act_dim)]  # split is obs+act
-
-    # Outputs are the concatenation of the last "columns" (rew + done) with the first element of the next row (next obs)
-    # They discard the first row (no previous state)
-    # outputs = torch.cat( [x[:-1, split:], x[1:, :obs_dim]], 1)
-    dataset_outputs = torch.cat([big_tensor[:-1, (obs_dim + act_dim):], big_tensor[1:, :obs_dim]], 1)
-
-    return dataset_inputs, dataset_outputs
 
 
 def split_dataset(data: torch.Tensor, split: Tuple[float, float, float]) \
@@ -289,10 +213,6 @@ def _train(model,
                 total_loss = 0.0
                 start_time = time.time()
 
-        # FIXME needed?
-        # if args.dry_run:
-        #    break
-
     return model
 
 
@@ -303,8 +223,8 @@ def _pad_and_masks(source, target, model, sequence_length, device):
 
     if source.shape[0] != sequence_length:
         # FIXME skip
-        tgt_mask = model.transformer.generate_square_subsequent_mask(target.shape[0]).to(device)
-        return source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask
+        #tgt_mask = model.transformer.generate_square_subsequent_mask(target.shape[0]).to(device)
+        #return source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask
 
         # Reshape tensors and fill with inf as temporary marker for [pad]
         pad = (0, 0, 0, 0, 0, sequence_length - source.shape[0])
@@ -364,15 +284,6 @@ def _evaluate(model, criterion, source_batches, target_batches, sequence_length,
     return model, total_loss / (len(source_batches) - 1)
 
 
-# NOTES
-# O=observation, A=action, R=reward, D=done
-# Transformer input sequence token is O+A, output token is R+D+O (next O)
-# Similar to translation for close languages
-# It may be possible to pack everything into a single type of token (O+A+R+D) too
-# An input/output sequence (NLP sentence) is a series of steps in the environment
-# Positional encoding can be used as normal
-# An episode is similar to a sentence
-
 def train_transformer(generate,
                       env_name,
                       rollouts,
@@ -426,7 +337,6 @@ def train_transformer(generate,
     if logger is not None:
         logger.debug(f'Built transformer model: "{model}"')
 
-    # TODO separate from here
     model = train_with_batches(epochs=epochs,
                                sequence_length=sequence_length,
                                clip=clip,
@@ -459,9 +369,6 @@ def train_with_batches(epochs,
                        save,
                        log_interval,
                        logger=None) -> torch.Tensor:
-    # For predicting the next state the transformer is given input and target sequences
-    # Sequences have length L steps (same as BPTT for words)
-
     criterion = nn.MSELoss()
     lr = 5.0
     best_val_loss = None
@@ -536,15 +443,15 @@ if __name__ == '__main__':
     env_name = 'LunarLander-v2'
     model = train_transformer(generate=True,
                               env_name=env_name,
-                              rollouts=10_000,
+                              rollouts=5_000,
                               clip=0.25,
                               epochs=40,
                               log_interval=50,
                               save=f'model-{env_name}.pt',
                               data_folder='./data',
-                              batch_size=128,
+                              batch_size=64,
                               num_features=256,
                               dropout=0.1,
-                              sequence_length=35,
+                              sequence_length=100,
                               device=device,
                               logger=logger)

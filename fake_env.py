@@ -1,5 +1,5 @@
 import torch
-from transformer import generate_dataset, _pad_and_masks, generate_dataset2
+from transformer import generate_dataset2
 
 
 class FakeEnvironment(object):
@@ -24,9 +24,12 @@ class FakeEnvironment(object):
     def _initialize(self):
         sources, targets = generate_dataset2(self.env,
                                              self.device,
-                                             self.seq_length, None, None)
+                                             self.seq_length,
+                                             None,
+                                             None)
 
-        self.last_observation = targets[-1, 2:].numpy()
+        # R + O + D marker
+        self.last_observation = targets[-1, 1:-1].numpy()
 
         self.inputs = sources.to(self.device)
         self.outputs = targets.to(self.device)
@@ -39,7 +42,8 @@ class FakeEnvironment(object):
         # Prepare new input from last observation and the given action
         new_input = torch.cat([
             torch.Tensor(self.last_observation),
-            torch.Tensor([action])
+            torch.Tensor([action]),
+            torch.Tensor([0.0])
         ]).to(self.device)
         # Make S,N,E with batch size 1
         new_input = new_input.reshape(1, -1)
@@ -48,7 +52,7 @@ class FakeEnvironment(object):
         self.inputs = torch.cat([self.inputs, new_input]).to(self.device)
 
         # Keep a rolling window of seq_length, keep inputs and outputs aligned
-        if self.inputs.size(0) > self.seq_length:
+        while self.inputs.size(0) > self.seq_length:
             self.inputs = self.inputs[1:, ]
             self.outputs = self.outputs[1:, ]
 
@@ -58,6 +62,7 @@ class FakeEnvironment(object):
         # Forward step to the transformer, predict masked token
         self.model.eval()
         with torch.no_grad():
+            # NOTE Expensive call
             output = self.model.forward(src=self.inputs.unsqueeze(1),
                                         tgt=self.outputs.unsqueeze(1),
                                         tgt_mask=tgt_mask)
@@ -70,9 +75,26 @@ class FakeEnvironment(object):
 
         # Extract elements from prediction
         reward = prediction[0].item()
-        done = prediction[1].item()
-        done = 1 if done > 0.9 else 0
-        observation = prediction[2:].cpu().numpy()
+        done = prediction[-1].item()
+        # Only EOS should have a 2.0 in that position
+        done = done >= 1.9
+        observation = prediction[1:-1].cpu().numpy()
+
+        # FIXME same as in generate_dataset
+        if done:
+            # Add EOS/SOS for both sources and targets
+            input_sos = torch.zeros(self.inputs.size(2))
+            input_sos[-1] = 1.0
+            output_sos = torch.zeros(self.outputs.size(2).shape)
+            output_sos[-1] = 1.0
+            input_eos = torch.zeros(self.inputs.size(2).shape)
+            input_eos[-1] = 2.0
+            output_eos = torch.zeros(self.outputs.size(2).shape)
+            output_eos[-1] = 2.0
+            self.inputs = torch.cat([self.inputs, input_eos.reshape(1, -1)])
+            self.inputs = torch.cat([self.inputs, input_sos.reshape(1, -1)])
+            self.outputs = torch.cat([self.outputs, output_eos.reshape(1, -1)])
+            self.outputs = torch.cat([self.outputs, output_sos.reshape(1, -1)])
 
         self.last_observation = observation
 

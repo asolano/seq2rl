@@ -150,9 +150,9 @@ def train_actor_critic(policy,
 
         # check if the environment is solved
         # FIXME the fake env can mark it as solved by mistake by giving too much reward
-        #  if cumulative_average > env.spec.reward_threshold:
-        #    print(f'Solved? Running reward={cumulative_average:.2f}, threshold={env.spec.reward_threshold}')
-        #    break
+        if cumulative_average > env.spec.reward_threshold:
+            print(f'Solved? Running reward={cumulative_average:.2f}, threshold={env.spec.reward_threshold}')
+            break
 
     print(f'total steps={total_steps}, last episode steps={s}')
     return policy, optimizer
