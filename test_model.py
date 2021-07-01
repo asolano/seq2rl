@@ -8,7 +8,7 @@ from fake_env import FakeEnvironment
 from main import test_policy_quality
 
 if __name__ == '__main__':
-    env_name = 'LunarLander-v2'
+    env_name = 'CartPole-v1'
 
     save_file = f'model-{env_name}.pt'
     world_model = torch.load(save_file)
@@ -20,15 +20,15 @@ if __name__ == '__main__':
     fake_env = FakeEnvironment(env, world_model, seq_length=35, device=device)
 
     # FIXME get from environment
-    policy = Policy(n_state=8,
-                    n_actions=4,
+    policy = Policy(n_state=4,
+                    n_actions=2,
                     fc1_dims=512).to(device)
 
     lr = 7e-4
     optimizer = optim.Adam(policy.parameters(), lr=lr)
 
     gamma = 0.99
-    max_episodes = 250
+    max_episodes = 1000
     max_steps = 200
     eps = np.finfo(np.float32).eps.item()
 
@@ -38,7 +38,7 @@ if __name__ == '__main__':
                                            gamma,
                                            eps,
                                            # FIXME env works
-                                           #env,
+                                           # env,
                                            fake_env,
                                            max_episodes,
                                            max_steps,

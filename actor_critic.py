@@ -47,6 +47,7 @@ class Policy(nn.Module):
 
 def select_action(model, observation, device):
     state = torch.from_numpy(observation).float().to(device)
+    model.to(device)
     probabilities, state_value = model(state)
 
     # Create a categorical distribution over the list of probabilities of actions
@@ -185,10 +186,10 @@ def test_policy_quality(env, policy, num_trials, max_steps, device, logger=None)
 if __name__ == '__main__':
     from utils import get_device
 
-    # env = gym.make('CartPole-v1')
+    env = gym.make('CartPole-v1')
     # env = gym.make('MountainCar-v0')
     # env = gym.make('Acrobot-v1')
-    env = gym.make('LunarLander-v2')
+    # env = gym.make('LunarLander-v2')
     # FIXME continuous actions require a different model
     # env = gym.make('LunarLanderContinuous-v2')
 
@@ -197,14 +198,15 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    device = get_device(cuda=False)
+    device = get_device(cuda=True)
     logger = utils.create_logger("ac")
 
-    n_chunks = 1  # 10
+    # Testing training model iteratively (retrain)
+    n_chunks = 2  # 10
     total_episodes = 1_000
     chunk_episodes = int(total_episodes / n_chunks)
 
-    lr = 7e-4  # 3e-2
+    lr = 3e-2
     gamma = 0.99
     max_steps = 250
     log_interval = 100

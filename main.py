@@ -11,7 +11,7 @@ import random
 import numpy as np
 import datetime
 
-from utils import (create_logger, set_random_seed, get_device, to_column_batches)
+from utils import (create_logger, set_random_seed, get_device, to_column_batches, get_env_dimensions)
 from typing import Tuple, Optional
 from model import CustomTransformer
 from transformer import train_with_batches, split_dataset, generate_dataset2
@@ -45,12 +45,12 @@ def parse_arguments():
                         help='number of rollouts when generating data')
     parser.add_argument('--batch-size',
                         type=int,
-                        default=20,
+                        default=32,
                         metavar='N',
                         help='transformer training batch size')
     parser.add_argument('--sequence-length',
                         type=int,
-                        default=35,
+                        default=200,
                         help='sequence length')
     parser.add_argument('--clip',
                         type=float,
@@ -102,29 +102,26 @@ def dreamer_algorithm(env_name,
     env = gym.make(env_name)
 
     # Transformer world model
-    save_filename = 'wm_save.pt'
-    obs_dim = env.observation_space.shape[0]
-    if type(env.action_space) == gym.spaces.Discrete:
-        action_dim = 1
-    else:
-        raise NotImplementedError("Get action dimensions")
+    save_filename = f'{env_name}_tf_model.pt'
 
-    # reward and done are scalars
-    reward_dim = 1
-    done_dim = 1
+    obs_dim, action_dim, reward_dim, done_dim = get_env_dimensions(env)
+
+    # source and target dimensions
     src_dim = obs_dim + action_dim + done_dim
     tgt_dim = reward_dim + obs_dim + done_dim
-    world_model = CustomTransformer(src_dim=src_dim,
+
+    transformer = CustomTransformer(src_dim=src_dim,
                                     tgt_dim=tgt_dim,
                                     d_model=args.num_features,
                                     nhead=2,
                                     num_encoder_layers=2,
                                     num_decoder_layers=2,
-                                    dim_feedforward=1024,
+                                    dim_feedforward=512,
                                     dropout=args.dropout,
                                     max_seq_length=args.sequence_length
                                     )
-    world_model = world_model.to(device)
+    transformer = transformer.to(device)
+    tf_optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
 
     # Actor Critic
     fc1_dims = 512
@@ -137,8 +134,8 @@ def dreamer_algorithm(env_name,
                     fc1_dims=fc1_dims)
     policy = policy.to(device)
 
-    lr = 5e-4
-    optimizer = optim.Adam(policy.parameters(), lr=lr)
+    lr = 3e-2
+    ac_optimizer = optim.Adam(policy.parameters(), lr=lr)
 
     train_sources, train_targets = torch.FloatTensor().to(device), torch.FloatTensor().to(device)
     valid_sources, valid_targets = torch.FloatTensor().to(device), torch.FloatTensor().to(device)
@@ -151,16 +148,16 @@ def dreamer_algorithm(env_name,
     split = 0.8, 0.1, 0.1
 
     # FIXME pretrain slightly the policy on real env
-    policy, optimizer = train_actor_critic(policy,
-                                           optimizer,
-                                           gamma=0.99,
-                                           eps=1e-5,
-                                           env=env,
-                                           max_episodes=50,
-                                           max_steps=250,
-                                           device=device,
-                                           log_interval=log_interval,
-                                           logger=logger)
+    #policy, optimizer = train_actor_critic(policy,
+    #                                       optimizer,
+    #                                       gamma=0.99,
+    #                                       eps=1e-5,
+    #                                       env=env,
+    #                                       max_episodes=50,
+    #                                       max_steps=250,
+    #                                       device=device,
+    #                                      log_interval=log_interval,
+    #                                       logger=logger)
 
     # fake_env = FakeEnvironment(env=env,
     #                            model=world_model,
@@ -192,13 +189,21 @@ def dreamer_algorithm(env_name,
         new_test_sources = to_column_batches(new_test_sources, batch_size, device)
         new_test_targets = to_column_batches(new_test_targets, batch_size, device)
 
+        # FIXME retrains every time
         # add to existing datasets
-        train_sources = torch.cat([train_sources, new_train_sources])
-        train_targets = torch.cat([train_targets, new_train_targets])
-        valid_sources = torch.cat([valid_sources, new_valid_sources])
-        valid_targets = torch.cat([valid_targets, new_valid_targets])
-        test_sources = torch.cat([test_sources, new_test_sources])
-        test_targets = torch.cat([test_targets, new_test_targets])
+        # train_sources = torch.cat([train_sources, new_train_sources])
+        # train_targets = torch.cat([train_targets, new_train_targets])
+        # valid_sources = torch.cat([valid_sources, new_valid_sources])
+        # valid_targets = torch.cat([valid_targets, new_valid_targets])
+        # test_sources = torch.cat([test_sources, new_test_sources])
+        # test_targets = torch.cat([test_targets, new_test_targets])
+
+        train_sources = new_train_sources
+        train_targets = new_train_targets
+        valid_sources = new_valid_sources
+        valid_targets = new_valid_targets
+        test_sources = new_test_sources
+        test_targets = new_test_targets
 
         logger.info(f'Train: {train_sources.shape}')
         logger.info(f'Test: {test_sources.shape}')
@@ -206,11 +211,12 @@ def dreamer_algorithm(env_name,
 
         # use the datasets to learn/improve the world model
         logger.debug(f'Training world model')
-        world_model = train_with_batches(epochs=args.epochs,
+        transformer = train_with_batches(epochs=args.epochs,
                                          sequence_length=args.sequence_length,
                                          clip=args.clip,
                                          device=device,
-                                         model=world_model,
+                                         model=transformer,
+                                         optimizer=tf_optimizer,
                                          train_inputs_batches=train_sources,
                                          train_outputs_batches=train_targets,
                                          valid_inputs_batches=valid_sources,
@@ -224,26 +230,26 @@ def dreamer_algorithm(env_name,
         # use world model to learn a policy
         logger.debug(f'Training policy')
         gamma = 0.99
-        max_episodes = 50
+        max_episodes = 100
         max_steps = 250
         eps = np.finfo(np.float32).eps.item()
 
         fake_env = FakeEnvironment(env=env,
-                                   model=world_model,
+                                   model=transformer,
                                    seq_length=args.sequence_length,
                                    device=device)
 
         # DEBUG use env for the real environment, it seems to learn properly
-        policy, optimizer = train_actor_critic(policy,
-                                               optimizer,
-                                               gamma,
-                                               eps,
-                                               fake_env,
-                                               max_episodes,
-                                               max_steps,
-                                               device=device,
-                                               log_interval=log_interval,
-                                               logger=logger)
+        policy, ac_optimizer = train_actor_critic(policy,
+                                                  ac_optimizer,
+                                                  gamma,
+                                                  eps,
+                                                  fake_env,
+                                                  max_episodes,
+                                                  max_steps,
+                                                  device=device,
+                                                  log_interval=log_interval,
+                                                  logger=logger)
 
         # check policies quality in the real environment
 

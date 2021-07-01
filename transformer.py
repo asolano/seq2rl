@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import time
 import math
 import random
@@ -12,7 +13,7 @@ from typing import Tuple
 
 from actor_critic import select_action
 from model import CustomTransformer
-from utils import to_column_batches
+from utils import to_column_batches, get_env_dimensions
 
 
 def load_dataset(save_path, environment: str, logger=None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -65,22 +66,20 @@ def generate_dataset2(env, device, num_tokens, policy, logger):
 
     observation = env.reset()
 
-    # FIXME get from env
-    action_dim = 1
-    done_dim = 1
-    reward_dim = 1
+    obs_dim, action_dim, reward_dim, done_dim = get_env_dimensions(env)
 
     # SOS, EOS tokens for sources and targets
     # Add an extra float to the vector, normally a zero
-    source_sos = torch.zeros(size=(observation.size + action_dim + done_dim,))
+    source_sos = torch.zeros(size=(obs_dim + action_dim + done_dim,))
     source_sos[-1] = 1.0
-    target_sos = torch.zeros(size=(reward_dim + observation.size + done_dim,))
+    target_sos = torch.zeros(size=(reward_dim + obs_dim + done_dim,))
     target_sos[-1] = 1.0
     source_eos = torch.zeros(size=source_sos.size())
     source_eos[-1] = 2.0
     target_eos = torch.zeros(size=target_sos.size())
     target_eos[-1] = 2.0
 
+    # start from SOS
     sources = torch.cat([sources, source_sos.reshape(1, -1)])
     targets = torch.cat([targets, target_sos.reshape(1, -1)])
 
@@ -93,7 +92,7 @@ def generate_dataset2(env, device, num_tokens, policy, logger):
         s = torch.cat([
             torch.Tensor(observation),
             torch.Tensor([action]),
-            torch.Tensor([0.0])  # extra float
+            torch.Tensor([0.0])  # the extra float
         ])
         sources = torch.cat([sources, s.reshape(1, -1)])
         observation, reward, done, _ = env.step(action)
@@ -142,6 +141,7 @@ def get_ith_batch(source, i, count):
 
 
 def _train(model,
+           optimizer,
            criterion,
            source_batches,
            target_batches,
@@ -160,39 +160,61 @@ def _train(model,
 
     for batch, i in enumerate(range(0, source_batches.size(0) - 1, sequence_length)):
         # Get source and target sequences
-        source = get_ith_batch(source_batches, i, count=sequence_length)
-        target = get_ith_batch(target_batches, i, count=sequence_length)
+        source = get_ith_batch(source_batches, i, count=sequence_length).to(device)
+        target = get_ith_batch(target_batches, i, count=sequence_length).to(device)
 
-        # Reset gradients
-        model.zero_grad()
+        if source.shape[0] != sequence_length:
+            print('foo')
 
-        # Masks
-        source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask = \
-            _pad_and_masks(source, target, model, sequence_length, device)
+        # Pad here
+        pad_value = float('inf')
+        # FIXME if source.shape[0] != sequence_length:
+        pad = (0, 0, 0, 0, 0, sequence_length - source.shape[0])
+        source = F.pad(input=source, pad=pad, value=pad_value)
+        target = F.pad(input=target, pad=pad, value=pad_value)
+
+        assert source.shape[0] == sequence_length
+        assert target.shape[0] == sequence_length
 
         # Shift target right 1 token
-        tgt_inp, tgt_out = target[:-1], target[1:]
-        tgt_mask = tgt_mask[:-1, :-1]  # 35x35 -> 34x34
-        if tgt_key_padding_mask is not None:
-            tgt_key_padding_mask = tgt_key_padding_mask[:, :-1]
+        tgt_inp = target[:-1]
+
+        # Masks
+        (
+            source,
+            tgt_inp,
+            src_mask,
+            tgt_mask,
+            src_key_padding_mask,
+            tgt_key_padding_mask,
+        ) = _create_masks(source, tgt_inp, model, sequence_length, device)
+
+        target[target == float('inf')] = 0.0
 
         # Get output from model
         output = model.forward(src=source,
                                tgt=tgt_inp,
+                               src_mask=src_mask,
+                               tgt_mask=tgt_mask,
                                src_key_padding_mask=src_key_padding_mask,
-                               memory_key_padding_mask=memory_key_padding_mask,
                                tgt_key_padding_mask=tgt_key_padding_mask,
-                               tgt_mask=tgt_mask)
+                               memory_key_padding_mask=src_key_padding_mask
+                               )
 
-        # Calculate and back-propagate loss
+        optimizer.zero_grad()
+
+        tgt_out = target[1:]
+
         loss = criterion(output, tgt_out)
         loss.backward()
 
+        optimizer.step()
+
         # TODO Confirm if this is needed for transformers
         # Prevent exploding gradients problem in RNNS/LSTMs
-        nn.utils.clip_grad_norm(model.parameters(), clip)
-        for p in model.parameters():
-            p.data.add_(-lr, p.grad)
+        # nn.utils.clip_grad_norm(model.parameters(), clip)
+        # for p in model.parameters():
+        #     p.data.add_(-lr, p.grad)
 
         # Accumulate loss
         total_loss += loss.item()
@@ -213,65 +235,70 @@ def _train(model,
                 total_loss = 0.0
                 start_time = time.time()
 
-    return model
+    return model, optimizer
 
 
-def _pad_and_masks(source, target, model, sequence_length, device):
+def _create_masks(source, target, model, sequence_length, device):
     src_key_padding_mask = None
     tgt_key_padding_mask = None
-    memory_key_padding_mask = None
-
-    if source.shape[0] != sequence_length:
-        # FIXME skip
-        #tgt_mask = model.transformer.generate_square_subsequent_mask(target.shape[0]).to(device)
-        #return source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask
-
-        # Reshape tensors and fill with inf as temporary marker for [pad]
-        pad = (0, 0, 0, 0, 0, sequence_length - source.shape[0])
-        source = torch.nn.functional.pad(source, pad=pad, value=float('inf'))
-
-        # Set to True where there is padding
-        # This is per batch, shape is (N, S)
-        src_key_padding_mask = source[:, :, 0].eq(float('inf')).T
-        memory_key_padding_mask = src_key_padding_mask.clone()
-        target = torch.nn.functional.pad(target, pad=pad, value=float('inf'))
-        tgt_key_padding_mask = target[:, :, 0].eq(float('inf')).T
-
-        # Replace inf with 0
-        source[source == float('inf')] = 0.0
-        target[target == float('inf')] = 0.0
 
     tgt_mask = model.transformer.generate_square_subsequent_mask(target.shape[0]).to(device)
+    src_mask = torch.zeros((source.shape[0], source.shape[0]), device=device).type(torch.bool)
 
-    return source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask
+    src_key_padding_mask = (source == float('inf'))[:, :, 0].transpose(0, 1)
+    tgt_key_padding_mask = (target == float('inf'))[:, :, 0].transpose(0, 1)
+
+    # remove the inf
+    source[source == float('inf')] = 0.0
+    target[target == float('inf')] = 0.0
+
+    return source, target, src_mask, tgt_mask, src_key_padding_mask, tgt_key_padding_mask
 
 
 def _evaluate(model, criterion, source_batches, target_batches, sequence_length, device, logger=None):
     model.eval()
     total_loss = 0.0
 
-    log_i = random.randrange(0, source_batches.size(0) - 1, sequence_length)
+    # log_i = random.randrange(0, source_batches.size(0) - 1, sequence_length)
+
     with torch.no_grad():
         for i in range(0, source_batches.size(0) - 1, sequence_length):
             # Get source and target sequences
-            source = get_ith_batch(source_batches, i, count=sequence_length)
-            target = get_ith_batch(target_batches, i, count=sequence_length)
+            source = get_ith_batch(source_batches, i, count=sequence_length).to(device)
+            target = get_ith_batch(target_batches, i, count=sequence_length).to(device)
 
-            source, target, tgt_mask, src_key_padding_mask, tgt_key_padding_mask, memory_key_padding_mask = \
-                _pad_and_masks(source, target, model, sequence_length, device)
+            # Pad here
+            pad_value = float('inf')
+            pad = (0, 0, 0, 0, 0, sequence_length - source.shape[0])
+            source = F.pad(input=source, pad=pad, value=pad_value)
+            target = F.pad(input=target, pad=pad, value=pad_value)
 
-            # Shift target right 1 token
-            tgt_inp, tgt_out = target[:-1], target[1:]
-            tgt_mask = tgt_mask[:-1, :-1]  # FIXME i.e. 35x35 -> 34x34
-            if tgt_key_padding_mask is not None:
-                tgt_key_padding_mask = tgt_key_padding_mask[:, :-1]
+            assert source.shape[0] == sequence_length
+            assert target.shape[0] == sequence_length
+
+            tgt_input = target[:-1]
+
+            (
+                source,
+                tgt_inp,
+                src_mask,
+                tgt_mask,
+                src_key_padding_mask,
+                tgt_key_padding_mask
+            ) = _create_masks(source, tgt_input, model, sequence_length, device)
+
+            target[target == float('inf')] = 0.0
 
             output = model(src=source,
                            tgt=tgt_inp,
+                           src_mask=src_mask,
+                           tgt_mask=tgt_mask,
                            src_key_padding_mask=src_key_padding_mask,
-                           memory_key_padding_mask=memory_key_padding_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
-                           tgt_mask=tgt_mask)
+                           memory_key_padding_mask=src_key_padding_mask
+                           )
+
+            tgt_out = target[1:]
 
             # if logger is not None and i == log_i:
             #     logger.debug(f"Sample evaluation"
@@ -360,6 +387,7 @@ def train_with_batches(epochs,
                        clip,
                        device,
                        model,
+                       optimizer,
                        train_inputs_batches,
                        train_outputs_batches,
                        valid_inputs_batches,
@@ -377,17 +405,18 @@ def train_with_batches(epochs,
         epoch_start_time = time.time()
 
         # Training
-        model = _train(model=model,
-                       criterion=criterion,
-                       source_batches=train_inputs_batches,
-                       target_batches=train_outputs_batches,
-                       sequence_length=sequence_length,
-                       clip=clip,
-                       lr=lr,
-                       epoch=epoch,
-                       device=device,
-                       log_interval=log_interval,
-                       logger=logger)
+        model, tf_optimizer = _train(model=model,
+                                     optimizer=optimizer,
+                                     criterion=criterion,
+                                     source_batches=train_inputs_batches,
+                                     target_batches=train_outputs_batches,
+                                     sequence_length=sequence_length,
+                                     clip=clip,
+                                     lr=lr,
+                                     epoch=epoch,
+                                     device=device,
+                                     log_interval=log_interval,
+                                     logger=logger)
 
         # Validation
         model, val_loss = _evaluate(model=model,
@@ -439,8 +468,8 @@ if __name__ == '__main__':
     set_random_seed(seed, logger)
     device = get_device(cuda, logger)
 
-    # env_name ='CartPole-v1'
-    env_name = 'LunarLander-v2'
+    env_name = 'CartPole-v1'
+    # env_name = 'LunarLander-v2'
     model = train_transformer(generate=True,
                               env_name=env_name,
                               rollouts=5_000,

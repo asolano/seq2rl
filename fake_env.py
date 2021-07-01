@@ -62,7 +62,7 @@ class FakeEnvironment(object):
         # Forward step to the transformer, predict masked token
         self.model.eval()
         with torch.no_grad():
-            # NOTE Expensive call
+            # FIXME Expensive call
             output = self.model.forward(src=self.inputs.unsqueeze(1),
                                         tgt=self.outputs.unsqueeze(1),
                                         tgt_mask=tgt_mask)
@@ -101,7 +101,7 @@ class FakeEnvironment(object):
         # DEBUG are the envs in sync?
         # true_observation, true_reward, true_done, _ = self.env.step(action)
         # mse = torch.sum((torch.tensor(true_observation) - observation) ** 2)
-        # print(f'MSE={mse}')
+        #  print(f'MSE={mse}')
 
         info = None
         return observation, reward, done, info

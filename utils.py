@@ -2,6 +2,8 @@
 
 import logging
 import torch
+import gym
+
 from typing import (Optional,)
 
 
@@ -59,3 +61,16 @@ def to_column_batches(data: torch.Tensor, batch_size: int, device: torch.device)
     trimmed = data.narrow(0, 0, n_batches * batch_size)
     batches = trimmed.view(batch_size, -1, data.size(1)).transpose(0, 1).contiguous()
     return batches.to(device)
+
+
+def get_env_dimensions(env):
+    obs_dim = env.observation_space.shape[0]
+    if type(env.action_space) == gym.spaces.Discrete:
+        action_dim = 1
+    else:
+        raise NotImplementedError(f"Get action dimensions for {type(env.action_space)}")
+
+    reward_dim = 1
+    done_dim = 1
+
+    return obs_dim, action_dim, reward_dim, done_dim
